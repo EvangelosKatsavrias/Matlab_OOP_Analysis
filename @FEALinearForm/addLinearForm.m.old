@@ -1,0 +1,139 @@
+function addLinearForm(obj, LinearFormSettings, varargin)
+
+if nargin > 2
+    knotPatches = varargin{1};
+    if isempty(knotPatches); knotPatches = obj.CAGDDomain.Connectivities.numberOfKnotPatches; end
+else knotPatches = obj.CAGDDomain.Connectivities.numberOfKnotPatches;
+end
+
+maxDerivOrder = 0;
+for index = 1:LinearFormSettings.numberOfSubforms; maxDerivOrder = max([maxDerivOrder cell2mat(LinearFormSettings.functionDerivativesOrder{index})]); end
+BasisFunctionsSettings = bSplineBasisFunctionsEvaluationSettings.empty(1,0);
+for index = 1:obj.CAGDDomain.GeneralInfo.totalNumberOfParametricCoordinates
+    BasisFunctionsSettings(index) = bSplineBasisFunctionsEvaluationSettings('RepetitiveGivenInKnotPatches', LinearFormSettings.numericalIntegration(index).pointsInParentDomain, maxDerivOrder, knotPatches, LinearFormSettings.numericalIntegration(index).parentDomain);
+end
+
+closureTopologyIndex = obj.CAGDDomain.requestClosureTopology(BasisFunctionsSettings);
+
+subFormPosition = length(obj.subFormData)+1;
+obj.subFormData(subFormPosition).Settings               = LinearFormSettings;
+obj.subFormData(subFormPosition).closureTopologyIndex   = closureTopologyIndex;
+
+if isempty(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).parametric2PhysicalInverseJacobians); obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).evaluateAllDomainMappings; end
+if isempty(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).BasisFunctions.tensorBasisFunctions); obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).BasisFunctions.evaluateTensorProducts; end
+[numOfFuns, numOfPoints, ~, numOfKnotPatches] = size(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).BasisFunctions.tensorBasisFunctions);
+
+weightsInParentDomain  = LinearFormSettings.numericalIntegration(1).weightsInParentDomain;
+for pointIndex = 2:length(LinearFormSettings.numericalIntegration)
+    weightsInParentDomain = kron(LinearFormSettings.numericalIntegration(pointIndex).weightsInParentDomain, weightsInParentDomain);
+end
+weightsInParentDomain   = reshape(weightsInParentDomain, numOfPoints, 1);
+weightsInPhysicalDomain = repmat(weightsInParentDomain, 1, numOfKnotPatches).*obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).parent2PhysicalDetOfJacobians;
+
+if isempty(obj.DOFData.mapOfDOFLocal2Global); obj.DOFData.constructLocalElementalDOF2GlobalDOF('EachComponent'); end
+
+if maxDerivOrder
+    if isempty(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).topologyGradients); obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).evaluateTopologyGradients; end
+end
+
+for subFormIndex = 1:LinearFormSettings.numberOfSubforms
+    
+    subFormTensorFieldIndices           = LinearFormSettings.tensorFieldIndices{subFormIndex};
+    subFormTensorFieldComponentIndices  = LinearFormSettings.tensorFieldComponentIndices{subFormIndex};
+    subFormFunctionDerivativesOrder     = LinearFormSettings.functionDerivativesOrder{subFormIndex};
+    subFormFunctionDerivativeComponents = LinearFormSettings.functionDerivativeComponents{subFormIndex};
+    subFormConstitutiveLaw              = LinearFormSettings.constitutiveLaw(subFormIndex);
+    
+    funs1 = [];
+    componentsLocalDOF1 = [];
+    for funIndex = 1:length(subFormFunctionDerivativesOrder{1})
+        if subFormFunctionDerivativesOrder{1}(funIndex) == 1
+            funs1 = cat(1, funs1, squeeze(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).topologyGradients(:, subFormFunctionDerivativeComponents{1}(funIndex), :, :)));
+        else funs1 = funs1 +squeeze(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).BasisFunctions.tensorBasisFunctions(:, :, 1, :));
+        end
+        componentsLocalDOF1 = [componentsLocalDOF1 obj.DOFData.componentsLocalDOF{subFormTensorFieldIndices{1}(funIndex)}(subFormTensorFieldComponentIndices{1}(funIndex))];
+    end
+    
+    funs2 = [];
+    componentsLocalDOF2 = [];
+    for funIndex = 1:length(subFormFunctionDerivativesOrder{2})
+        if subFormFunctionDerivativesOrder{2}(funIndex) == 1
+            funs2 = cat(1, funs2, squeeze(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).topologyGradients(:, subFormFunctionDerivativeComponents{2}(funIndex), :, :)));
+        else funs2 = funs2 +squeeze(obj.CAGDDomain.ClosureTopologies(closureTopologyIndex).BasisFunctions.tensorBasisFunctions(:, :, 1, :));
+        end
+        componentsLocalDOF2 = [componentsLocalDOF2 obj.DOFData.componentsLocalDOF{subFormTensorFieldIndices{2}(funIndex)}(subFormTensorFieldComponentIndices{2}(funIndex))];
+    end
+
+    for knotPatchIndex = 1:numOfKnotPatches
+        knotPatchContribution = subFormConstitutiveLaw*funs1(:, :, knotPatchIndex)...
+            *(funs2(:, :, knotPatchIndex)'.*repmat(weightsInPhysicalDomain(:, knotPatchIndex), 1, numOfFuns*length(componentsLocalDOF2)));
+        
+        DOFMap1 = obj.DOFData.mapOfDOFLocal2Global(reshape(repmat(numOfFuns*(componentsLocalDOF1-1), numOfFuns, 1) +repmat((1:numOfFuns)', 1, length(componentsLocalDOF1)), 1, []), knotPatchIndex);
+        DOFMap2 = obj.DOFData.mapOfDOFLocal2Global(reshape(repmat(numOfFuns*(componentsLocalDOF2-1), numOfFuns, 1) +repmat((1:numOfFuns)', 1, length(componentsLocalDOF2)), 1, []), knotPatchIndex);
+        obj.values(DOFMap1, DOFMap2) = obj.values(DOFMap1, DOFMap2) + knotPatchContribution;
+        
+    end
+    
+end
+
+end
+
+
+
+% firstLeftKnotSpan = find(knotSpans>impositionInterval(1), 1, 'first')-1;
+% LastLeftKnotSpan = find(knotSpans<impositionInterval(2), 1, 'last');
+% 
+% for knotSpanIndex = 1:LastLeftKnotSpan-firstLeftKnotSpan+1
+%     
+%     knownDOF = zeros(2*(curveDegree+1),1);
+%     currentControlPositions = controlPolygon(knotSpanIndex, :);
+%     currentControlPoints = edgeControlPoints(currentControlPositions, :);
+%     currentWeights = edgeWeights(currentControlPositions);
+%     
+%     for integrationPointIndex = 1:numberOfIntegrationPoints
+%         
+%         integrationFactor = doubleHeaviside(impositionInterval(1), impositionInterval(2), integrationPoints(knotSpanIndex, integrationPointIndex));
+%         
+%         N = basisFunctions(1, :, integrationPointIndex, knotSpanIndex);
+%         
+%         Nw = N*currentWeights;
+%         
+%         nomin = basisFunctions(2, :, integrationPointIndex, knotSpanIndex).*currentWeights'*Nw ...
+%             -N.*currentWeights'.*repmat(basisFunctions(2, :, integrationPointIndex, knotSpanIndex)*currentWeights, 1, size(basisFunctions, 2));
+%         
+%         denom = Nw^2;
+%         
+%         R1 = N.*currentWeights'/Nw;
+%         
+%         R_dRdu = cat(1, R1, nomin/denom);
+%         
+%         R = R_dRdu(1,:)';
+%         dRdu = R_dRdu(2,:);
+%         
+%         dxyzdu = currentControlPoints'*dRdu';
+%         
+%         jacParametric2Physical = norm(dxyzdu, 2);
+%         
+%         detJacParametric2Physical = jacParametric2Physical;
+%         
+%         dx = direction{1}(integrationPoints(knotSpanIndex, integrationPointIndex));
+%         dy = direction{2}(integrationPoints(knotSpanIndex, integrationPointIndex));
+%         distribution = integrationFactor*distributionFunction(integrationPoints(knotSpanIndex, integrationPointIndex))*[dx;dy];
+%         
+%         detJacParent2Parametric = Subdomain.Topology.Mappings.Parent2Parametric.detOfJacobian(knotSpanIndex);
+%         % Computation of element's traction force vector
+%         knownDOF = knownDOF + reshape(distribution*R'*integrationWeights(integrationPointIndex)*detJacParent2Parametric*detJacParametric2Physical*Subdomain.Properties.CrossSection.beamWidth, [], 1);
+%         
+%     end
+%     
+%     DOFMap = reshape(Subdomain.NumericalAnalysis.DOFData.globalDOFNum(controlPointsMap(currentControlPositions), :)', [], 1);
+%     
+%     if ~isfield(Subdomain.NumericalAnalysis.Matrices, 'knownDOFvalues')
+%         Subdomain.NumericalAnalysis.Matrices.knownDOFvalues = knownDOF;
+%     else
+%         Subdomain.NumericalAnalysis.Matrices.knownDOFvalues = cat(1, Subdomain.NumericalAnalysis.Matrices.knownDOFvalues, knownDOF);
+%     end
+%        
+%     forceVector = Subdomain.NumericalAnalysis.Matrices.store{1}(:, DOFMap)*knownDOF;
+% 
+% end
